@@ -1,0 +1,6 @@
+#!/bin/bash
+set -e
+
+cd "$(dirname "$0")"
+. ci/util/keep_editable_fbuild.sh
+uv run test.py "$@"

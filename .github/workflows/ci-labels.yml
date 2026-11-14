@@ -1,0 +1,152 @@
+name: CI board selection
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+# Label consumption gets its own group so a burst of label events cannot
+# cancel the removal before it runs (GEN-031 clauses 2 and 4).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.action == 'labeled' && github.event.label.name == 'ci-full' && 'consume' || 'validate' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # GEN-031 clause 2 (forge-ci/ci.yml#476): `ci-full` buys exactly one full
+  # matrix. The label-gated workflows also run on `synchronize`, so a sticky
+  # label would re-run the whole matrix on every later push. This job removes
+  # the label as soon as it is applied; the `labeled` event has already started
+  # the full run in every gated workflow. The removal uses GITHUB_TOKEN, whose
+  # events start no new workflow runs, so the resulting `unlabeled` event does
+  # not cancel the full run through its concurrency group. Re-add the label to
+  # request another full run (at most two per PR, GEN-031 clause 3).
+  # Fork PRs get a read-only token, but the gated jobs already refuse fork
+  # heads, so no full run starts there and nothing needs removing.
+  consume-ci-full:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      github.event.label.name == 'ci-full' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove the consumed ci-full label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR" --repo "$GITHUB_REPOSITORY" --remove-label ci-full
+
+  validate:
+    if: github.event.pull_request == null || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: astral-sh/setup-uv@v6
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+          version: "0.8.0"
+      - name: Check registry and generated board gates
+        run: bash ci-labels check
+      - name: Check GitHub label catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash ci-labels labels-check
+      - name: Resolve requested board cells
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: bash ci-labels select --event-file "$GITHUB_EVENT_PATH" >> "$GITHUB_STEP_SUMMARY"
+      # Classification includes historical entries this PR did not create.
+      # Keep that report informational; budget applies the checker's native
+      # PR ownership rules and reports inherited overflow as a warning.
+      - name: Classify live cache entries (read only)
+        if: github.event_name != 'merge_group'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          uv tool run --python 3.12
+          --from git+https://github.com/zackees/ci.yml@5ac6eed923bbc6c78c088b96e5ffcc977ad20701
+          ci-lint cache audit --repo "$GITHUB_WORKSPACE" --default-branch master
+      - name: Check live cache retention target (read only)
+        if: github.event_name != 'merge_group'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          uv tool run --python 3.12
+          --from git+https://github.com/zackees/ci.yml@5ac6eed923bbc6c78c088b96e5ffcc977ad20701
+          ci-lint cache budget --repo "$GITHUB_WORKSPACE" --default-branch master
+
+  # Merge queue gate. The queue tests the exact merge result with the same
+  # smoke inventory the standalone wrappers run on PRs; GitHub cannot require
+  # a check spanning workflows, so these jobs live beside the required summary.
+  queue-unit-linux:
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/template_unit_test.yml
+    with:
+      os: ubuntu-24.04
+      build-mode: debug-thin
+      full-suite: false
+
+  queue-unit-windows:
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/template_unit_test.yml
+    with:
+      os: windows-latest
+      full-suite: false
+
+  queue-examples-linux:
+    if: github.event_name == 'merge_group'
+    uses: ./.github/workflows/template_example_test.yml
+    with:
+      os: ubuntu-24.04
+      build-mode: debug-thin
+      example-group: CompileTests
+
+  # Merge queue gate: refuse a PR with unresolved CodeRabbit review threads,
+  # unless CodeRabbit is rate limited (exhausted) and cannot re-review.
+  queue-coderabbit:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          save-cache: false
+          version: "0.8.0"
+      - name: Check CodeRabbit threads are resolved
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+        run: uv run --no-project --python 3.12 --with 'running-process>=4.0.0,<4.10.10' python ci/coderabbit_gate.py --repo "$GITHUB_REPOSITORY" --ref "$QUEUE_REF"
+
+  # Required by the master ruleset on PRs and in the queue. Fork PRs skip
+  # `validate` and get no hosted CI until a maintainer enqueues them, so
+  # reviewing a fork PR's workflow changes remains a precondition of enqueueing.
+  ci-summary:
+    name: CI summary
+    if: always()
+    needs: [validate, queue-unit-linux, queue-unit-windows, queue-examples-linux, queue-coderabbit]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check job results
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

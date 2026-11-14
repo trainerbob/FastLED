@@ -1,3 +1,5 @@
+// IWYU pragma: private
+
 #ifndef __INC_FASTSPI_APOLLO3_H
 #define __INC_FASTSPI_APOLLO3_H
 
@@ -5,27 +7,65 @@
 // It uses fastgpio instead of actual SPI, which means you can use it on all pins.
 // It can run slightly faster than the default fastpin (bit banging).
 
-#include "FastLED.h"
+#include "fastspi_types.h"
+#include "fl/system/delay.h"
+#include "fl/stl/compiler_control.h"
+#include "fl/stl/noexcept.h"
 
-FASTLED_NAMESPACE_BEGIN
+FL_DISABLE_WARNING_PUSH
+FL_DISABLE_WARNING_DEPRECATED_REGISTER
 
+namespace fl {
 #if defined(FASTLED_APOLLO3)
 
 #define FASTLED_ALL_PINS_HARDWARE_SPI
 
-template <uint8_t _DATA_PIN, uint8_t _CLOCK_PIN, uint32_t _SPI_CLOCK_DIVIDER>
+/// Half the divider, rounded up so odd dividers never shorten the period.
+constexpr u32 apollo3SpiPhaseCycles(u32 divider) FL_NO_EXCEPT {
+	return divider / 2 + (divider & 1);
+}
+
+/// Iterations of apollo3SpiLoopDelay that take at least `cycles`. On Cortex-M4,
+/// N iterations of SUBS and BNE take at least 3N-1 cycles: 1 for each SUBS, 2 for
+/// each taken BNE and 1 for the final one, which falls through.
+constexpr u32 apollo3SpiLoopCount(u32 cycles) FL_NO_EXCEPT {
+	return cycles == 0 ? 0 : (cycles + 3) / 3;
+}
+
+/// Longest phase written as NOPs. GCC already unrolled the old loop this far.
+constexpr u32 kApollo3SpiMaxInlineNops = 8;
+
+/// Exactly N NOPs. The assembler repeats them, so no call can appear even with
+/// inlining disabled.
+template <u32 N>
+FASTLED_FORCE_INLINE void apollo3SpiNops() FL_NO_EXCEPT {
+	__asm__ __volatile__(".rept %c0\n\t nop\n\t .endr" : : "n"(N));
+}
+
+/// Counted delay whose cost does not depend on compiler loop shaping.
+FASTLED_FORCE_INLINE void apollo3SpiLoopDelay(u32 count) FL_NO_EXCEPT {
+#if defined(__thumb__)
+	__asm__ __volatile__("1: subs %0, #1\n\t bne 1b" : "+l"(count) : : "cc");
+#else
+	while (count--) { // Host test build; only target disassembly shows timing.
+		__asm__ __volatile__("nop");
+	}
+#endif
+}
+
+template <u8 _DATA_PIN, u8 _CLOCK_PIN, u32 _SPI_CLOCK_DIVIDER>
 class APOLLO3HardwareSPIOutput {
-	Selectable *m_pSelect;
+	Selectable *mPSelect;
 
 public:
-	APOLLO3HardwareSPIOutput() { m_pSelect = NULL; }
-	APOLLO3HardwareSPIOutput(Selectable *pSelect) { m_pSelect = pSelect; }
+	APOLLO3HardwareSPIOutput() { mPSelect = nullptr; }
+	APOLLO3HardwareSPIOutput(Selectable *pSelect) { mPSelect = pSelect; }
 
 	// set the object representing the selectable
-	void setSelect(Selectable *pSelect) { m_pSelect = pSelect; }
+	void setSelect(Selectable *pSelect) { mPSelect = pSelect; }
 
 	// initialize the pins for fastgpio
-	void init() {
+	void init() FL_NO_EXCEPT {
 		FastPin<_CLOCK_PIN>::setOutput();
 		FastPin<_CLOCK_PIN>::lo();
 		FastPin<_DATA_PIN>::setOutput();
@@ -38,11 +78,19 @@ public:
 	// release the CS select
 	void inline release() { /* TODO */ }
 
+	void endTransaction() FL_NO_EXCEPT {
+		waitFully();
+		release();
+	}
+
 	// wait until all queued up data has been written
 	static void waitFully() { /* TODO */ }
 
+	// finalize transmission (no-op on Apollo3, exists for compatibility with ESP32 Quad-SPI)
+	static void finalizeTransmission() { }
+
 	// write a byte as bits
-	static void writeByte(uint8_t b) {
+	static void writeByte(u8 b) FL_NO_EXCEPT {
 		writeBit<7>(b);
 		writeBit<6>(b);
 		writeBit<5>(b);
@@ -54,26 +102,26 @@ public:
 	}
 
 	// write a word out via SPI (returns immediately on writing register)
-	static void writeWord(uint16_t w) {
-		writeByte((uint8_t)((w >> 8) & 0xff));
-		writeByte((uint8_t)(w & 0xff));
+	static void writeWord(u16 w) FL_NO_EXCEPT {
+		writeByte((u8)((w >> 8) & 0xff));
+		writeByte((u8)(w & 0xff));
 	}
 
 	// A raw set of writing byte values, assumes setup/init/waiting done elsewhere
-	static void writeBytesValueRaw(uint8_t value, int len) {
+	static void writeBytesValueRaw(u8 value, int len) FL_NO_EXCEPT {
 		while(len--) { writeByte(value); }
 	}
 
 	// A full cycle of writing a value for len bytes, including select, release, and waiting
-	void writeBytesValue(uint8_t value, int len) {
+	void writeBytesValue(u8 value, int len) FL_NO_EXCEPT {
 		select();
 		writeBytesValueRaw(value, len);
 		release();
 	}
 
 	// A full cycle of writing a value for len bytes, including select, release, and waiting
-	template <class D> void writeBytes(register uint8_t *data, int len) {
-		uint8_t *end = data + len;
+	template <class D> void writeBytes(FASTLED_REGISTER u8 *data, int len) FL_NO_EXCEPT {
+		u8 *end = data + len;
 		select();
 		// could be optimized to write 16bit words out instead of 8bit bytes
 		while(data != end) {
@@ -85,10 +133,10 @@ public:
 	}
 
 	// A full cycle of writing a value for len bytes, including select, release, and waiting
-	void writeBytes(register uint8_t *data, int len) { writeBytes<DATA_NOP>(data, len); }
+	void writeBytes(FASTLED_REGISTER u8 *data, int len) { writeBytes<DATA_NOP>(data, len); }
 
 	// write a single bit out, which bit from the passed in byte is determined by template parameter
-	template <uint8_t BIT> inline static void writeBit(uint8_t b) {
+	template <u8 BIT> FASTLED_FORCE_INLINE static void writeBit(u8 b) FL_NO_EXCEPT {
 		//waitFully();
 		if(b & (1 << BIT)) {
 			FastPin<_DATA_PIN>::hi();
@@ -97,14 +145,26 @@ public:
 		}
 
 		FastPin<_CLOCK_PIN>::hi();
-		for (uint32_t d = (_SPI_CLOCK_DIVIDER >> 1); d > 0; d--) { __NOP(); }
+		delayPhase();
 		FastPin<_CLOCK_PIN>::lo();
-		for (uint32_t d = (_SPI_CLOCK_DIVIDER >> 1); d > 0; d--) { __NOP(); }
+		delayPhase();
 	}
 
+private:
+	static constexpr u32 kPhaseCycles = apollo3SpiPhaseCycles(_SPI_CLOCK_DIVIDER);
+
+	FASTLED_FORCE_INLINE static void delayPhase() FL_NO_EXCEPT {
+		if (kPhaseCycles <= kApollo3SpiMaxInlineNops) {
+			apollo3SpiNops<(kPhaseCycles <= kApollo3SpiMaxInlineNops ? kPhaseCycles : 0)>();
+		} else {
+			apollo3SpiLoopDelay(apollo3SpiLoopCount(kPhaseCycles));
+		}
+	}
+
+public:
 	// write a block of uint8_ts out in groups of three.  len is the total number of uint8_ts to write out.  The template
 	// parameters indicate how many uint8_ts to skip at the beginning and/or end of each grouping
-	template <uint8_t FLAGS, class D, EOrder RGB_ORDER> void writePixels(PixelController<RGB_ORDER> pixels) {
+	template <u8 FLAGS, class D, EOrder RGB_ORDER> void writePixels(PixelController<RGB_ORDER> pixels, void* context = nullptr) FL_NO_EXCEPT {
 		select();
 
 		int len = pixels.mLen;
@@ -128,7 +188,8 @@ public:
 };
 
 #endif
+}  // namespace fl
 
-FASTLED_NAMESPACE_END
+FL_DISABLE_WARNING_POP
 
 #endif

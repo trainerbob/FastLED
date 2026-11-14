@@ -1,23 +1,38 @@
-#ifndef __INC_DMX_H
-#define __INC_DMX_H
+/// @file dmx.h
+/// Defines the DMX512-based LED controllers.
 
-#include "FastLED.h"
+#pragma once
 
-#ifdef DmxSimple_h
+#include "fl/system/fastled.h"
+
+/// @addtogroup Chipsets
+/// @{
+
+/// @addtogroup ClocklessChipsets
+/// @{
+
+#if defined(DmxSimple_h) || defined(FASTLED_DOXYGEN)
+// IWYU pragma: begin_keep
 #include <DmxSimple.h>
+// IWYU pragma: end_keep
+
+/// Flag set when the DmxSimple library is included
 #define HAS_DMX_SIMPLE
 
-///@ingroup chipsets
-///@{
-FASTLED_NAMESPACE_BEGIN
 
-// note - dmx simple must be included before FastSPI for this code to be enabled
-template <uint8_t DATA_PIN, EOrder RGB_ORDER = RGB> class DMXSimpleController : public CPixelLEDController<RGB_ORDER> {
+/// DMX512 based LED controller class, using the DmxSimple library
+/// @tparam DATA_PIN the data pin for the output of the DMX bus
+/// @tparam RGB_ORDER the RGB ordering for these LEDs
+/// @see https://www.pjrc.com/teensy/td_libs_DmxSimple.html
+/// @see https://github.com/PaulStoffregen/DmxSimple
+/// @see https://en.wikipedia.org/wiki/DMX512
+template <fl::u8 DATA_PIN, EOrder RGB_ORDER = RGB> class DMXSimpleController : public CPixelLEDController<RGB_ORDER> {
 public:
-	// initialize the LED controller
+	/// Initialize the LED controller
 	virtual void init() { DmxSimple.usePin(DATA_PIN); }
 
 protected:
+	/// @copydoc CPixelLEDController::showPixels()
 	virtual void showPixels(PixelController<RGB_ORDER> & pixels) {
 		int iChannel = 1;
 		while(pixels.has(1)) {
@@ -30,20 +45,31 @@ protected:
 	}
 };
 
-FASTLED_NAMESPACE_END
+
 
 #endif
 
-#ifdef DmxSerial_h
+#if defined(DmxSerial_h) || defined(FASTLED_DOXYGEN)
+// IWYU pragma: begin_keep
 #include <DMXSerial.h>
+// IWYU pragma: end_keep
 
-FASTLED_NAMESPACE_BEGIN
+/// Flag set when the DMXSerial library is included
+#define HAS_DMX_SERIAL
 
+
+
+/// DMX512 based LED controller class, using the DMXSerial library
+/// @tparam RGB_ORDER the RGB ordering for these LEDs
+/// @see http://www.mathertel.de/Arduino/DMXSerial.aspx
+/// @see https://github.com/mathertel/DMXSerial
+/// @see https://en.wikipedia.org/wiki/DMX512
 template <EOrder RGB_ORDER = RGB> class DMXSerialController : public CPixelLEDController<RGB_ORDER> {
 public:
-	// initialize the LED controller
+	/// Initialize the LED controller
 	virtual void init() { DMXSerial.init(DMXController); }
 
+	/// @copydoc CPixelLEDController::showPixels().
 	virtual void showPixels(PixelController<RGB_ORDER> & pixels) {
 		int iChannel = 1;
 		while(pixels.has(1)) {
@@ -56,10 +82,9 @@ public:
 	}
 };
 
-FASTLED_NAMESPACE_END
-///@}
 
-#define HAS_DMX_SERIAL
-#endif
+
+/// @} DMXControllers
+/// @} Chipsets
 
 #endif

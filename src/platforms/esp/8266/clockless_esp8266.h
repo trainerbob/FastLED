@@ -1,104 +1,98 @@
 #pragma once
 
-FASTLED_NAMESPACE_BEGIN
+// IWYU pragma: private
 
-#ifdef FASTLED_DEBUG_COUNT_FRAME_RETRIES
-extern uint32_t _frame_cnt;
-extern uint32_t _retry_cnt;
-#endif
+#include "fl/stl/stdint.h"
+#include "eorder.h"
+#include "fl/stl/compiler_control.h"
+#include "fl/chipsets/timing_traits.h"
+#include "fastled_delay.h"
+#include "fl/stl/compiler_control.h"
+#include "fl/stl/noexcept.h"
+#include "fl/system/delay.h"
+#include "platforms/esp/8266/clockless_esp8266_bits.h"
+
+FL_DISABLE_WARNING_PUSH
+FL_DISABLE_WARNING_DEPRECATED_REGISTER
+namespace fl {
 
 // Info on reading cycle counter from https://github.com/kbeckmann/nodemcu-firmware/blob/ws2812-dual/app/modules/ws2812.c
-__attribute__ ((always_inline)) inline static uint32_t __clock_cycles() {
-  uint32_t cyc;
+__attribute__ ((always_inline)) inline static u32 __clock_cycles() FL_NO_EXCEPT {
+  u32 cyc;
   __asm__ __volatile__ ("rsr %0,ccount":"=a" (cyc));
   return cyc;
 }
 
-#define FASTLED_HAS_CLOCKLESS 1
+#define FL_CLOCKLESS_CONTROLLER_DEFINED 1
 
-template <int DATA_PIN, int T1, int T2, int T3, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = 85>
+#ifndef FASTLED_ESP8266_CLOCKLESS_WAIT_TIME
+#define FASTLED_ESP8266_CLOCKLESS_WAIT_TIME 85
+#endif
+
+template <int DATA_PIN, typename TIMING, EOrder RGB_ORDER = RGB, int XTRA0 = 0, bool FLIP = false, int WAIT_TIME = FASTLED_ESP8266_CLOCKLESS_WAIT_TIME>
 class ClocklessController : public CPixelLEDController<RGB_ORDER> {
 	typedef typename FastPin<DATA_PIN>::port_ptr_t data_ptr_t;
 	typedef typename FastPin<DATA_PIN>::port_t data_t;
+
+	// Convert nanoseconds to CPU cycles (compile-time)
+	// Formula: cycles = (ns * (F_CPU / 1MHz) + 500) / 1000
+	// +500 for rounding to nearest cycle
+	static constexpr u32 NS_TO_CYCLES(u32 ns) FL_NO_EXCEPT {
+		return (ns * (F_CPU / 1000000UL) + 500) / 1000;
+	}
+
+	static constexpr u32 T1 = NS_TO_CYCLES(TIMING::T1);  // Convert nanoseconds → CPU cycles
+	static constexpr u32 T2 = NS_TO_CYCLES(TIMING::T2);
+	static constexpr u32 T3 = NS_TO_CYCLES(TIMING::T3);
 
 	data_t mPinMask;
 	data_ptr_t mPort;
 	CMinWait<WAIT_TIME> mWait;
 public:
-	virtual void init() {
+	virtual void init() FL_NO_EXCEPT {
 		FastPin<DATA_PIN>::setOutput();
 		mPinMask = FastPin<DATA_PIN>::mask();
 		mPort = FastPin<DATA_PIN>::port();
 	}
 
-	virtual uint16_t getMaxRefreshRate() const { return 400; }
+	virtual u16 getMaxRefreshRate() const FL_NO_EXCEPT { return 400; }
 
 protected:
 
-	virtual void showPixels(PixelController<RGB_ORDER> & pixels) {
+	virtual void showPixels(PixelController<RGB_ORDER> & pixels) FL_NO_EXCEPT {
     mWait.wait();
 		int cnt = FASTLED_INTERRUPT_RETRY_COUNT;
     while((showRGBInternal(pixels)==0) && cnt--) {
       #ifdef FASTLED_DEBUG_COUNT_FRAME_RETRIES
       ++_retry_cnt;
       #endif
-      delayMicroseconds(WAIT_TIME);
+      fl::delayMicroseconds(WAIT_TIME);
     }
     mWait.mark();
   }
 
-#define _ESP_ADJ (0)
-#define _ESP_ADJ2 (0)
-
-	template<int BITS> __attribute__ ((always_inline)) inline static bool writeBits(register uint32_t & last_mark, register uint32_t b)  {
-    b <<= 24; b = ~b;
-    for(register uint32_t i = BITS; i > 0; --i) {
-      while((__clock_cycles() - last_mark) < (T1+T2+T3));
-			last_mark = __clock_cycles();
-      FastPin<DATA_PIN>::hi();
-
-      while((__clock_cycles() - last_mark) < T1);
-      if(b & 0x80000000L) { FastPin<DATA_PIN>::lo(); }
-      b <<= 1;
-
-      while((__clock_cycles() - last_mark) < (T1+T2));
-      FastPin<DATA_PIN>::lo();
-
-			// even with interrupts disabled, the NMI interupt seems to cause
-			// timing issues here. abort the frame if one bit took to long. if the
-			// last of the 24 bits has been sent already, it is too late
-			// this fixes the flickering first pixel that started to occur with
-			// framework version 3.0.0
-			if ((__clock_cycles() - last_mark) >= (T1 + T2 + T3 - 5)) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-
-	static uint32_t ICACHE_RAM_ATTR showRGBInternal(PixelController<RGB_ORDER> pixels) {
+	static u32 showRGBInternal(PixelController<RGB_ORDER> pixels) FL_NO_EXCEPT {
 		// Setup the pixel controller and load/scale the first byte
 		pixels.preStepFirstByteDithering();
-		register uint32_t b = pixels.loadAndScale0();
+		FASTLED_REGISTER u32 b = pixels.loadAndScale0();
 		pixels.preStepFirstByteDithering();
-		uint32_t start;
+		u32 start;
 		
 		// This function has multiple exits, so we'll use an object
 		// with a destructor that releases the interrupt lock, regardless
 		// of how we exit the function.  It also has methods for manually
 		// unlocking and relocking interrupts temporarily.
 		struct InterruptLock {
-			InterruptLock() {
+			InterruptLock() FL_NO_EXCEPT {
 				os_intr_lock();
 			}
 			~InterruptLock() {
 				os_intr_unlock();
 			}
-			void Unlock() {
+			void Unlock() FL_NO_EXCEPT {
 				os_intr_unlock();
 			}
-			void Lock() {
+			void Lock() FL_NO_EXCEPT {
 				os_intr_lock();
 			}
 		};
@@ -107,22 +101,16 @@ protected:
 			InterruptLock intlock;
 
 			start = __clock_cycles();
-			uint32_t last_mark = start;
+			u32 last_mark = start;
+			const esp8266_clockless::BitTiming timing = {T1, T2, T3};
 			while(pixels.has(1)) {
-				// Write first byte, read next byte
-				if (writeBits<8+XTRA0>(last_mark, b)) {
-					return 0;
-				}
-				b = pixels.loadAndScale1();
-
-				// Write second byte, read 3rd byte
-				if (writeBits<8+XTRA0>(last_mark, b)) {
-					return 0;
-				}
-				b = pixels.loadAndScale2();
-
-				// Write third byte, read 1st byte of next pixel
-				if (writeBits<8+XTRA0>(last_mark, b)) {
+				// Load the pixel before its first bit; the timed bits then run
+				// entirely from IRAM.
+				const u8 bytes[3] = {static_cast<u8>(b),
+				                     pixels.loadAndScale1(),
+				                     pixels.loadAndScale2()};
+				if (!esp8266_clockless::sendPixel(last_mark, bytes, 8 + XTRA0,
+				                                  DATA_PIN, timing)) {
 					return 0;
 				}
 
@@ -136,8 +124,8 @@ protected:
 				#if (FASTLED_ALLOW_INTERRUPTS == 1)
 				intlock.Lock();
 				// if interrupts took longer than 45µs, punt on the current frame
-				if((int32_t)(__clock_cycles()-last_mark) > 0) {
-					if((int32_t)(__clock_cycles()-last_mark) > (T1+T2+T3+((WAIT_TIME-INTERRUPT_THRESHOLD)*CLKS_PER_US))) {
+				if((i32)(__clock_cycles()-last_mark) > 0) {
+					if((i32)(__clock_cycles()-last_mark) > (i32)(T1+T2+T3+((WAIT_TIME-INTERRUPT_THRESHOLD)*CLKS_PER_US))) {
 						return 0;
 					}
 				}
@@ -151,5 +139,6 @@ protected:
 		return __clock_cycles() - start;
 	}
 };
+}  // namespace fl
 
-FASTLED_NAMESPACE_END
+FL_DISABLE_WARNING_POP

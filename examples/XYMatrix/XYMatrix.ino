@@ -1,3 +1,9 @@
+/// @file    XYMatrix.ino
+/// @brief   Demonstrates how to use an XY position helper function with a 2D matrix
+/// @example XYMatrix.ino
+
+// @filter: (board is not ATtiny1604)
+
 #include <FastLED.h>
 
 #define LED_PIN  3
@@ -25,8 +31,14 @@
 
 
 // Params for width and height
+#if FL_PLATFORM_HAS_TINY_MEMORY
+// A 16x16 CRGB matrix uses 768 B before controller state and stack.
+const uint8_t kMatrixWidth = 4;
+const uint8_t kMatrixHeight = 4;
+#else
 const uint8_t kMatrixWidth = 16;
 const uint8_t kMatrixHeight = 16;
+#endif
 
 // Param for different pixel layouts
 const bool    kMatrixSerpentineLayout = true;
@@ -166,29 +178,20 @@ uint16_t XY( uint8_t x, uint8_t y)
 CRGB leds_plus_safety_pixel[ NUM_LEDS + 1];
 CRGB* const leds( leds_plus_safety_pixel + 1);
 
-uint16_t XYsafe( uint8_t x, uint8_t y)
+// NOTE: the return type must be SIGNED. Returning -1 from a uint16_t makes the
+// value 65535, which only behaves like -1 where int is 16 bits wide (AVR). On a
+// 32-bit board it promotes to the int 65535, so leds[XYsafe(...)] indexes far
+// past the array instead of landing on the safety pixel.
+//
+// `int` rather than `int16_t` so that on 32-bit boards the type stays wide
+// enough for any matrix a board that size can actually hold.
+int XYsafe( uint8_t x, uint8_t y)
 {
   if( x >= kMatrixWidth) return -1;
   if( y >= kMatrixHeight) return -1;
   return XY(x,y);
 }
 
-
-// Demo that USES "XY" follows code below
-
-void loop()
-{
-    uint32_t ms = millis();
-    int32_t yHueDelta32 = ((int32_t)cos16( ms * (27/1) ) * (350 / kMatrixWidth));
-    int32_t xHueDelta32 = ((int32_t)cos16( ms * (39/1) ) * (310 / kMatrixHeight));
-    DrawOneFrame( ms / 65536, yHueDelta32 / 32768, xHueDelta32 / 32768);
-    if( ms < 5000 ) {
-      FastLED.setBrightness( scale8( BRIGHTNESS, (ms * 256) / 5000));
-    } else {
-      FastLED.setBrightness(BRIGHTNESS);
-    }
-    FastLED.show();
-}
 
 void DrawOneFrame( uint8_t startHue8, int8_t yHueDelta8, int8_t xHueDelta8)
 {
@@ -208,3 +211,21 @@ void setup() {
   FastLED.addLeds<CHIPSET, LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection(TypicalSMD5050);
   FastLED.setBrightness( BRIGHTNESS );
 }
+
+
+// Demo that USES "XY" follows code below
+
+void loop()
+{
+    uint32_t ms = millis();
+    int32_t yHueDelta32 = ((int32_t)cos16( ms * (27/1) ) * (350 / kMatrixWidth));
+    int32_t xHueDelta32 = ((int32_t)cos16( ms * (39/1) ) * (310 / kMatrixHeight));
+    DrawOneFrame( ms / 65536, yHueDelta32 / 32768, xHueDelta32 / 32768);
+    if( ms < 5000 ) {
+      FastLED.setBrightness( scale8( BRIGHTNESS, (ms * 256) / 5000));
+    } else {
+      FastLED.setBrightness(BRIGHTNESS);
+    }
+    FastLED.show();
+}
+

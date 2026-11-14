@@ -1,0 +1,64 @@
+name: esp_extra_libs
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - 'src/**'
+      - 'examples/**'
+      - 'ci/**'
+      - '.github/workflows/build_esp_extra_libs.yml'
+      - 'CMakeLists.txt'
+      - 'platformio.ini'
+      - 'library.json'
+      - 'library.properties'
+      - 'pyproject.toml'
+      - 'uv.lock'
+
+
+permissions:
+  contents: read        # Required to checkout code
+  actions: read         # Required for artifact operations  
+  id-token: write      # Required for artifact upload (OIDC)
+  pull-requests: read   # If needed to read PR info
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install uv for pinned esptool
+        uses: astral-sh/setup-uv@v6
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+
+      - name: Set up fbuild (install + cache)
+        uses: FastLED/fbuild/.github/actions/setup@main
+        with:
+          save: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+          fbuild-version: latest
+          install-cache-key-extra: ${{ hashFiles('pyproject.toml') }}
+          cache-key-extra: kitchensink-${{ hashFiles('ci/kitchensink/platformio.ini', 'library.json') }}
+
+      # The kitchensink project pulls AsyncTCP, ESPAsyncWebServer, ArduinoJson,
+      # OTA and mDNS alongside FastLED (symlinked in through src_dir) so the
+      # library-selection path is exercised against real third-party deps.
+      - name: Build kitchensink project with fbuild
+        run: |
+          uv --version
+          fbuild ci/kitchensink build

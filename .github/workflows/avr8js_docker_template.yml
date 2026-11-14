@@ -1,0 +1,81 @@
+name: AVR8JS Test Template (fbuild)
+
+# The existing template path is retained for workflow callers. fbuild owns
+# compilation, avr8js setup, execution and process shutdown.
+on:
+  workflow_call:
+    inputs:
+      platform:
+        description: 'AVR8JS target (uno)'
+        required: true
+        type: string
+      platform_display:
+        description: 'Display name for the platform (e.g., Arduino Uno)'
+        required: true
+        type: string
+      sketch:
+        description: 'Arduino sketch/example to test (e.g., Test, Blink)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  id-token: write
+  pull-requests: read
+
+jobs:
+  avr8js_test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Pin python version
+        run: echo "3.10" > .python-version
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+          version: "0.8.0"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install project dependencies
+        run: uv sync
+
+      - name: "Build and emulate ${{ inputs.sketch }} on ${{ inputs.platform_display }}"
+        timeout-minutes: 20
+        env:
+          BOARD: ${{ inputs.platform }}
+          EXAMPLE: ${{ inputs.sketch }}
+        run: |
+          set -o pipefail
+          bash test --run "$BOARD" "$EXAMPLE" 2>&1 | tee avr8js_output.log
+        shell: bash
+
+      - name: Artifact sketch name
+        if: always()
+        id: artifact_name
+        env:
+          EXAMPLE: ${{ inputs.sketch }}
+        run: echo "sketch=${EXAMPLE//\//_}" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Upload AVR8JS output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.platform }}-avr8js-${{ steps.artifact_name.outputs.sketch }}-${{ github.sha }}
+          path: avr8js_output.log
+          if-no-files-found: warn
+          retention-days: 7

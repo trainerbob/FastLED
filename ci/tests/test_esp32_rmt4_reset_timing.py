@@ -1,0 +1,57 @@
+"""Regression contract for ESP32 RMT4 reset/latch timing."""
+
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+HEADER = (
+    ROOT
+    / "src"
+    / "platforms"
+    / "esp"
+    / "32"
+    / "drivers"
+    / "rmt"
+    / "rmt_4"
+    / "channel_driver_rmt4.h"
+)
+IMPLEMENTATION = HEADER.with_suffix(".cpp.hpp")
+CLOCKLESS = HEADER.parent / "idf4_clockless_rmt_esp32.h"
+
+
+def test_rmt4_keeps_idle_low_until_chipset_reset_time_elapses() -> None:
+    header = HEADER.read_text(encoding="utf-8")
+    implementation = IMPLEMENTATION.read_text(encoding="utf-8")
+    poll = implementation[implementation.index("ChannelEngineRMT4Impl::poll()") :]
+    completion = poll[
+        poll.index("if (!state.resetWaitStarted") : poll.index(
+            "#if FASTLED_RMT4_TRANSMISSION_TIMEOUT_MS"
+        )
+    ]
+
+    assert "resetStartTimeUs" in header
+    assert "resetDurationUs" in header
+    assert "gpio_matrix_out" not in completion
+    assert "rmt_wait_tx_done(state.channel, 0) == ESP_OK" in completion
+    assert "state.resetStartTimeUs = fl::micros();" in completion
+    assert "state->resetDurationUs = data->getTiming().reset_us;" in implementation
+    assert (
+        "fl::micros() - state.resetStartTimeUs >= state.resetDurationUs" in completion
+    )
+    assert "releaseChannel(&state);" in completion
+
+
+SLIM_BRIDGE = ROOT / "src" / "fl" / "channels" / "slim_bridge_controller.h"
+
+
+def test_rmt4_legacy_wait_time_can_only_extend_trait_reset_time() -> None:
+    # #4604 moved the RMT4 controller onto SlimBridgeController, which now
+    # owns the WAIT_TIME -> reset_us folding for every bridged driver.
+    clockless = CLOCKLESS.read_text(encoding="utf-8")
+    assert (
+        "public SlimBridgeController<DATA_PIN, TIMING, RGB_ORDER, WAIT_TIME, "
+        "BusTraits<Bus::RMT>, 0," in " ".join(clockless.split())
+    )
+    bridge = SLIM_BRIDGE.read_text(encoding="utf-8")
+    assert "static_cast<u32>(WAIT_TIME) > timing.reset_us" in bridge
+    assert "timing.reset_us = static_cast<u32>(WAIT_TIME);" in bridge

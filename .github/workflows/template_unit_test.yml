@@ -1,0 +1,281 @@
+name: unit tests template
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        required: true
+        type: string
+        description: 'Runner OS (ubuntu-latest, macos-latest, or windows-latest)'
+      build-mode:
+        required: false
+        type: string
+        default: debug
+        description: 'Native sanitizer preset (debug or Linux-only debug-thin)'
+      full-suite:
+        required: false
+        type: boolean
+        default: true
+        description: 'Run every native/Python test; false uses ci/native_ci.py smoke inventory'
+
+permissions:
+  contents: read        # Required to checkout code
+  actions: read         # Required for artifact operations
+  pull-requests: read   # If needed to read PR info
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ${{ inputs.os }}
+    env:
+      FASTLED_NATIVE_CLANG: ${{ startsWith(inputs.os, 'ubuntu') && 'soldr' || '' }}
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          save-cache: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule') }}
+          enable-cache: true
+          cache-dependency-glob: "**/pyproject.toml"
+          version: "0.8.0" # 0.8.8 has problems with deployment on linux.
+
+      - name: Install libunwind-dev (Linux only)
+        if: runner.os == 'Linux'
+        # Refresh apt indexes before install so stale mirror metadata
+        # (e.g. a transitional liblzma-dev version the mirror hasn't
+        # propagated yet, returning 404) doesn't fail the build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libunwind-dev
+
+      - name: Install
+        run: ./install
+        shell: bash
+
+      - name: JavaScript lint
+        if: runner.os == 'Linux'
+        run: |
+          set -o pipefail
+          bash lint --js 2>&1 | tee js-lint.log
+          grep -q 'ESLint completed successfully' js-lint.log
+          grep -q 'TypeScript type checking completed successfully' js-lint.log
+        shell: bash
+
+      - name: Cache Rust C++ linter build
+        # Skips the ~60-180s soldr cargo build on every CI run when the
+        # crate sources haven't changed. Keyed on Cargo.lock + every .rs
+        # under the crate's src/ tree so any meaningful change forces a
+        # rebuild. Persists the cached fastled-lint binary plus the
+        # native-Python fingerprint that the build-on-change wrapper
+        # consults at lint time. See FastLED #3288.
+        id: rust-lint-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ci/lint_cpp_rs/target
+            .cache/rust_lint_binary.fingerprint
+          key: rust-lint-${{ runner.os }}-${{ hashFiles('ci/lint_cpp_rs/Cargo.lock', 'ci/lint_cpp_rs/src/**/*.rs', 'ci/lint_cpp_rs/Cargo.toml') }}
+          restore-keys: |
+            rust-lint-${{ runner.os }}-
+
+      - name: Rust C++ linter unit tests
+        # The crate carries ~53 tests covering real rule behaviour -- the
+        # SRC00x subprocess codes, SingletonElision/PreferConstexpr's
+        # partition, the unity-build structural checks -- and until now CI
+        # never ran them. Only `bash lint --cpp` below ran, which exercises
+        # the BINARY but not its tests, so a broken rule shipped silently.
+        #
+        # Two things were already broken when this step was added: the
+        # crate's own 1,000-line-per-file rule (unity_build.rs had reached
+        # 1,205) and a doctest that tried to compile a C++ snippet as Rust.
+        # Both are fixed in the same change.
+        run: |
+          uv run soldr cargo test --release --manifest-path ci/lint_cpp_rs/Cargo.toml
+        shell: bash
+
+      - name: Provision clang-query for required AST lint
+        run: |
+          if command -v clang-query >/dev/null 2>&1; then
+            clang-query --version
+            exit 0
+          fi
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y clang-tools
+            if ! command -v clang-query >/dev/null 2>&1; then
+              query_bin="$(find /usr/bin -maxdepth 1 -name 'clang-query-*' | sort -V | tail -n 1)"
+              test -x "$query_bin"
+              mkdir -p "$RUNNER_TEMP/clang-query-bin"
+              ln -s "$query_bin" "$RUNNER_TEMP/clang-query-bin/clang-query"
+              echo "$RUNNER_TEMP/clang-query-bin" >> "$GITHUB_PATH"
+            fi
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            brew install llvm
+            echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          else
+            choco install llvm --no-progress -y
+            echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+          fi
+        shell: bash
+
+      - name: Verify clang-query AST prerequisite
+        run: |
+          command -v clang-query
+          clang-query --version
+        shell: bash
+
+      - name: C++ lint (Rust path)
+        # Exercises the Rust C++ linter (`fastled-lint`) end-to-end via the
+        # default `bash lint --cpp` path on every PR. The binary is rebuilt
+        # only if the crate sources changed; otherwise it runs directly.
+        # See FastLED #3288.
+        run: |
+          bash lint --cpp
+        shell: bash
+
+      - name: Python tests (ci/tests)
+        # Complete ~1,500-test suite for ci-full/release. A deterministic
+        # color/CI guard smoke subset runs on ordinary Linux PR/master.
+        # Historically no pull-request workflow ran these tests. The C++ runs here
+        # and in `build_linux.yml` both exclude them by definition -- `--unit`
+        # is "C++ unit tests only" and `--cpp` "suppresses Python tests" --
+        # and the one job that did run `bash test --py`, `mp3_cpu_audit.yml`,
+        # is path-filtered to the mp3 codec, so it never fires for a change
+        # under `ci/`.
+        #
+        # That left the guards the colour pipeline is measured against gating
+        # nothing on the way in. A failure reached master in #4340 and stayed
+        # there until the suite happened to be run locally. FastLED#4359.
+        #
+        # Linux only: these are pure Python and platform-independent, and the
+        # template runs on three OSes.
+        #
+        # `--clean` because a CI step that can silently skip its own tests is
+        # the failure this step exists to prevent. Nothing restores
+        # `.cache/fingerprint/` today -- the cache above holds only
+        # `ci/lint_cpp_rs/target` and `.cache/rust_lint_binary.fingerprint` --
+        # so the suite would run without it, but a later widening of that
+        # `path:` would turn this step green and empty with no other symptom.
+        # `--clean` is the sanctioned way to force a run; the flag that
+        # disables fingerprinting outright is forbidden by project policy.
+        # With `--py` it forces the run without touching the native build the
+        # next step consumes -- checked, object count unchanged.
+        if: runner.os == 'Linux' && inputs.full-suite
+        run: |
+          uv run test.py --py --clean
+        shell: bash
+
+      - name: Agent doc budget ratchets
+        # `tests/` is collected by neither Python mode in this workflow: the
+        # full suite runs `ci/tests` and the smoke inventory is a fixed `ci/`
+        # list (`ci/native_ci.py` PY_SMOKE, capped at ten entries). A ratchet
+        # that no runner collects is a comment, not a gate - an entry page can
+        # grow past its byte ceiling and still merge green. Cheap: one file of
+        # pure filesystem assertions, Linux only.
+        if: runner.os == 'Linux'
+        run: uv run pytest -q --tb=short tests/test_binary_size_docs.py
+        shell: bash
+
+      - name: Python smoke tests
+        if: runner.os == 'Linux' && !inputs.full-suite
+        run: |
+          mapfile -t smoke_py < <(bash ci-native py)
+          test "${#smoke_py[@]}" -gt 0
+          uv run pytest -q --tb=short "${smoke_py[@]}"
+        shell: bash
+
+      - name: CI prerequisite and compile-deadline regressions
+        if: runner.os == 'Linux' && !inputs.full-suite
+        run: |
+          uv run pytest -q --tb=short \
+            ci/tests/test_setup_js_linting_fast.py \
+            ci/tests/test_ast_lint_prerequisite.py \
+            ci/tests/test_compile_deadline.py
+        shell: bash
+
+      - name: Run All Unit Tests
+        id: run_tests
+        if: inputs.full-suite
+        env:
+          FASTLED_BUILD_MODE: ${{ inputs.build-mode }}
+        run: |
+          set -o pipefail
+          ./test --clang --no-parallel --unit --verbose --build-mode "$FASTLED_BUILD_MODE" --log-failures failures 2>&1 | tee test.log
+        shell: bash
+
+      - name: Run Native Unit Smoke
+        id: run_smoke
+        if: '!inputs.full-suite'
+        env:
+          FASTLED_BUILD_MODE: ${{ inputs.build-mode }}
+        run: |
+          set -eo pipefail
+          mapfile -t smoke_cpp < <(bash ci-native cpp)
+          test "${#smoke_cpp[@]}" -gt 0
+          for target in "${smoke_cpp[@]}"; do
+            ./test --clang --no-parallel --unit "$target" --verbose --build-mode "$FASTLED_BUILD_MODE" --log-failures failures 2>&1 | tee -a test.log
+          done
+        shell: bash
+
+      - name: Linux native build bytes
+        if: always() && runner.os == 'Linux'
+        env:
+          FASTLED_BUILD_MODE: ${{ inputs.build-mode }}
+        run: |
+          if [[ -d ".build/meson-$FASTLED_BUILD_MODE" ]]; then
+            du -sb ".build/meson-$FASTLED_BUILD_MODE"
+          fi
+        shell: bash
+
+      - name: Test summary and failure logs
+        if: always()
+        run: |
+          echo "############################################"
+          echo "Last 100 lines of test.log (most recent output)"
+          echo "############################################"
+          tail -n 100 test.log || true
+
+          echo ""
+          echo "############################################"
+          echo "Failure logs (if any)"
+          echo "############################################"
+          fail_dir="failures"
+          if [ -d "$fail_dir" ] && ls "$fail_dir"/*.log >/dev/null 2>&1; then
+            # Failures exist - print them and exit with error
+            for f in "$fail_dir"/*.log; do
+              echo "----------------------"
+              echo "$(basename "$f")"
+              echo "----------------------"
+              # Print the failure log content
+              cat "$f"
+              echo ""
+            done
+            echo "TESTS FAILED: See failure logs above"
+            exit 1
+          else
+            echo "ALL UNIT TESTS PASSED"
+          fi
+        shell: bash
+
+      - name: Save rust-lint-cache on default-branch writers
+        if: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'schedule') && steps.rust-lint-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ci/lint_cpp_rs/target
+            .cache/rust_lint_binary.fingerprint
+          key: ${{ steps.rust-lint-cache.outputs.cache-primary-key }}
